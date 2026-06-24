@@ -306,9 +306,6 @@ class Document(BaseDocument):
 		if hasattr(self, "__setup__"):
 			self.__setup__()
 
-		if not is_doctype:
-			self.mask_fields()
-
 		return self
 
 	def mask_fields(self):
@@ -316,9 +313,25 @@ class Document(BaseDocument):
 
 		mask_fields = frappe.get_meta(self.doctype).get_masked_fields()
 
+		if mask_fields:
+			# Flag masked fields so get_valid_dict() does not cast the XXXXXXXX placeholder
+			# back to 0 for numeric fieldtypes when serializing the response.
+			self.flags.masked_fieldnames = {field.fieldname for field in mask_fields}
+
 		for field in mask_fields:
 			val = self.get(field.fieldname)
 			self.set(field.fieldname, mask_field_value(field, val))
+
+		for table_field in self.meta.get_table_fields():
+			child_mask_fields = frappe.get_meta(table_field.options).get_masked_fields()
+			if not child_mask_fields:
+				continue
+
+			masked_fieldnames = {field.fieldname for field in child_mask_fields}
+			for row in self.get(table_field.fieldname) or []:
+				row.flags.masked_fieldnames = masked_fieldnames
+				for field in child_mask_fields:
+					row.set(field.fieldname, mask_field_value(field, row.get(field.fieldname)))
 
 	def load_children_from_db(self):
 		is_doctype = self.doctype == "DocType"
@@ -560,6 +573,7 @@ class Document(BaseDocument):
 
 		self.check_if_locked()
 		self._set_defaults()
+		self._restore_masked_fields_from_db()
 		self.check_permission("write", "save")
 
 		self.set_user_and_timestamp()
@@ -934,7 +948,7 @@ class Document(BaseDocument):
 		return same
 
 	def apply_fieldlevel_read_permissions(self):
-		"""Remove values the user is not allowed to read."""
+		"""Remove values the user is not allowed to read, and mask fields per mask permissions."""
 		if frappe.session.user == "Administrator":
 			return
 
@@ -943,6 +957,7 @@ class Document(BaseDocument):
 			all_fields += frappe.get_meta(table_field.options).fields or []
 
 		if all(df.permlevel == 0 for df in all_fields):
+			self.mask_fields()
 			return
 
 		has_access_to = self.get_permlevel_access("read")
@@ -962,6 +977,40 @@ class Document(BaseDocument):
 						if hasattr(child, df.fieldname):
 							delattr(child, df.fieldname)
 
+		self.mask_fields()
+
+	def _restore_masked_fields_from_db(self):
+		"""Restore masked field values from DB so that link-field user-permission checks
+		are not tripped by the XXXXXXXX placeholder sent from the client."""
+		if frappe.flags.in_install or frappe.session.user == "Administrator" or self.is_new():
+			return
+
+		mask_fields = self.meta.get_masked_fields()
+		child_mask_fields = {
+			table_field.fieldname: masked
+			for table_field in self.meta.get_table_fields()
+			if (masked := frappe.get_meta(table_field.options).get_masked_fields())
+		}
+		if not mask_fields and not child_mask_fields:
+			return
+
+		# frappe.db.get_value() goes through the query builder which re-masks results for
+		# non-admin users, returning XXXXXXXX. frappe.get_doc() uses load_from_db() which
+		# queries the DB directly and always returns the actual stored value.
+		db_doc = frappe.get_doc(self.doctype, self.name)
+		for df in mask_fields:
+			self.set(df.fieldname, db_doc.get(df.fieldname))
+
+		for fieldname, masked in child_mask_fields.items():
+			db_rows = {row.name: row for row in db_doc.get(fieldname)}
+			for row in self.get(fieldname) or []:
+				db_row = db_rows.get(row.name)
+				# new rows have no DB counterpart — nothing to restore
+				if not db_row:
+					continue
+				for df in masked:
+					row.set(df.fieldname, db_row.get(df.fieldname))
+
 	def validate_higher_perm_levels(self):
 		"""If the user does not have permissions at permlevel > 0, then reset the values to original / default"""
 		if self.flags.ignore_permissions or frappe.flags.in_install:
@@ -973,10 +1022,8 @@ class Document(BaseDocument):
 		has_access_to = self.get_permlevel_access()
 		high_permlevel_fields = self.meta.get_high_permlevel_fields()
 
-		mask_fields = self.meta.get_masked_fields()
-
-		if high_permlevel_fields or mask_fields:
-			self.reset_values_if_no_permlevel_access(has_access_to, high_permlevel_fields, mask_fields)
+		if high_permlevel_fields:
+			self.reset_values_if_no_permlevel_access(has_access_to, high_permlevel_fields)
 
 		# If new record then don't reset the values for child table
 		if self.is_new():
